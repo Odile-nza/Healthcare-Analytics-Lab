@@ -1,0 +1,311 @@
+# Part 2: Query Analysis — Healthcare OLTP Performance
+# =====================================================
+# Database: healthcare_analytics (PostgreSQL on Neon)
+# Dataset:  1000 patients, 10000 encounters, 20000 diagnoses,
+#           20000 procedures, 10000 billing records
+# =====================================================
+
+===============================================================
+QUESTION 1: Monthly Encounters by Specialty
+===============================================================
+
+SQL QUERY:
+----------
+EXPLAIN ANALYZE
+SELECT
+    TO_CHAR(e.encounter_date, 'YYYY-MM') AS month,
+    s.specialty_name,
+    e.encounter_type,
+    COUNT(e.encounter_id)                AS total_encounters,
+    COUNT(DISTINCT e.patient_id)         AS unique_patients
+FROM encounters e
+JOIN providers p   ON e.provider_id  = p.provider_id
+JOIN specialties s ON p.specialty_id = s.specialty_id
+GROUP BY 1, 2, 3
+ORDER BY 1, 2;
+
+SCHEMA ANALYSIS:
+----------------
+Tables joined:  encounters, providers, specialties
+Number of joins: 2
+Join chain:     encounters → providers → specialties
+
+PERFORMANCE:
+------------
+Execution time:        66.451 ms
+Planning time:         12.960 ms
+Rows returned:         36 rows
+Rows scanned:
+  - encounters:        10000 rows (full table scan)
+  - providers:         3 rows
+  - specialties:       3 rows
+  Total:               10006 rows
+Memory used:           931kB (quicksort)
+
+BOTTLENECK IDENTIFIED:
+----------------------
+1. TO_CHAR() Function on Every Row
+   The expression TO_CHAR(e.encounter_date, 'YYYY-MM') is
+   called on every single encounter row (10000 times).
+   This is a function call on every row before grouping
+   can happen — expensive at scale.
+
+2. Full Sequential Scan on Encounters
+   No index is used on encounter_date. PostgreSQL reads
+   all 10000 rows to evaluate the TO_CHAR() function
+   before filtering or grouping.
+
+3. JOIN Chain to Get specialty_name
+   To attach a specialty name to each encounter the query
+   must traverse: encounters → providers → specialties.
+   This is 2 hops just to get one descriptive attribute.
+   At 1 million encounters this chain becomes very slow.
+
+4. Large Sort Operation
+   Sorting 10000 rows for GROUP BY required 931kB of
+   memory. At production scale this spills to disk.
+
+ROOT CAUSE: TO_CHAR() function called 10000 times +
+            2-hop JOIN chain to reach specialty_name.
+
+
+===============================================================
+QUESTION 2: Top Diagnosis-Procedure Pairs
+===============================================================
+
+SQL QUERY:
+----------
+EXPLAIN ANALYZE
+SELECT
+    d.icd10_code,
+    d.icd10_description,
+    pr.cpt_code,
+    pr.cpt_description,
+    COUNT(*) AS encounter_count
+FROM encounters e
+JOIN encounter_diagnoses  ed ON e.encounter_id  = ed.encounter_id
+JOIN diagnoses             d  ON ed.diagnosis_id = d.diagnosis_id
+JOIN encounter_procedures  ep ON e.encounter_id  = ep.encounter_id
+JOIN procedures            pr ON ep.procedure_id = pr.procedure_id
+GROUP BY 1, 2, 3, 4
+ORDER BY encounter_count DESC;
+
+SCHEMA ANALYSIS:
+----------------
+Tables joined:   encounters, encounter_diagnoses, diagnoses,
+                 encounter_procedures, procedures
+Number of joins: 4
+Join chain:      encounters → encounter_diagnoses → diagnoses
+                 encounters → encounter_procedures → procedures
+
+PERFORMANCE:
+------------
+Execution time:        120.023 ms
+Planning time:         26.688 ms
+Rows returned:         9 rows
+Rows scanned:
+  - encounters:        10000 rows
+  - encounter_diagnoses: 20000 rows
+  - encounter_procedures: 20000 rows
+  - diagnoses:         3 rows
+  - procedures:        3 rows
+  Intermediate rows:   40000 rows (after join explosion!)
+  Total scanned:       50006 rows
+Memory used:           3373kB (largest of all 4 queries!)
+
+BOTTLENECK IDENTIFIED:
+----------------------
+1. Row Explosion from Two Junction Tables (Biggest Problem)
+   When encounter_diagnoses and encounter_procedures are
+   joined together through encounters, the result set
+   multiplies:
+     10000 encounters × 2 diagnoses × 2 procedures
+     = 40000 intermediate rows
+   This is confirmed by the query plan:
+     Sort Memory: 3373kB — 3.6x more than Query 1
+   The final result is only 9 rows but 40000 rows had
+   to be processed and sorted first.
+
+2. Five Table Join
+   4 joins across 5 tables is the most complex join
+   in this lab. The optimizer must evaluate multiple
+   possible join orders making planning expensive.
+
+3. Sequential Scans on All Tables
+   All 5 tables use sequential scans — no indexes
+   are used. With 20000 rows in junction tables this
+   is particularly expensive.
+
+4. High Memory Usage
+   3373kB sort memory + 1038kB hash memory for
+   encounter_procedures = over 4MB just for this query.
+
+ROOT CAUSE: Row explosion from joining two junction tables
+            produces 40000 intermediate rows to return 9.
+
+
+===============================================================
+QUESTION 3: 30-Day Readmission Rate
+===============================================================
+
+SQL QUERY:
+----------
+EXPLAIN ANALYZE
+SELECT
+    s.specialty_name,
+    COUNT(DISTINCT e1.encounter_id)  AS total_discharges,
+    COUNT(DISTINCT e2.encounter_id)  AS readmissions,
+    ROUND(
+        COUNT(DISTINCT e2.encounter_id) * 100.0
+        / NULLIF(COUNT(DISTINCT e1.encounter_id), 0), 2
+    ) AS readmission_rate_pct
+FROM encounters e1
+JOIN providers p   ON e1.provider_id  = p.provider_id
+JOIN specialties s ON p.specialty_id  = s.specialty_id
+LEFT JOIN encounters e2
+    ON  e1.patient_id     = e2.patient_id
+    AND e2.encounter_date > e1.discharge_date
+    AND e2.encounter_date <= e1.discharge_date + INTERVAL '30 days'
+    AND e2.encounter_id  != e1.encounter_id
+WHERE e1.encounter_type = 'Inpatient'
+GROUP BY s.specialty_name
+ORDER BY readmission_rate_pct DESC;
+
+SCHEMA ANALYSIS:
+----------------
+Tables joined:   encounters e1, providers, specialties,
+                 encounters e2 (self-join)
+Number of joins: 3 regular joins + 1 self-join
+Join type:       Hash Left Join on patient_id
+
+PERFORMANCE:
+------------
+Execution time:        12.432 ms
+Planning time:         3.353 ms
+Rows returned:         1 row
+Rows scanned:
+  - encounters e1:     10000 scanned, 3334 matched (Inpatient)
+  - encounters e2:     10000 rows (full scan for self-join)
+  Rows removed by join filter: 33888 (self-join overhead!)
+Memory used:           597kB (for self-join hash table)
+
+BOTTLENECK IDENTIFIED:
+----------------------
+1. Self-Join O(n²) Complexity (Critical at Scale)
+   The query joins encounters against itself to find
+   readmissions. This means every inpatient encounter
+   is compared against every other encounter for the
+   same patient:
+     3334 inpatient × 10000 all encounters = potential
+     33 million comparisons at scale.
+   Evidence from query plan:
+     Rows Removed by Join Filter: 33888
+   At 1 million encounters this becomes catastrophic:
+     333,400 × 1,000,000 = 333 billion comparisons.
+
+2. Full Sequential Scan Twice
+   The encounters table is scanned twice:
+   - Once as e1 (filtered to Inpatient: 3334 rows)
+   - Once as e2 (all 10000 rows for comparison)
+   No index on encounter_type or discharge_date.
+
+3. Filter Applied After Scan
+   WHERE e1.encounter_type = 'Inpatient' removes 6666
+   rows AFTER reading all 10000 — wasteful without index.
+
+ROOT CAUSE: Self-join on encounters table has O(n²)
+            complexity — grows exponentially with data.
+
+
+===============================================================
+QUESTION 4: Revenue by Specialty & Month
+===============================================================
+
+SQL QUERY:
+----------
+EXPLAIN ANALYZE
+SELECT
+    s.specialty_name,
+    TO_CHAR(b.claim_date, 'YYYY-MM') AS month,
+    SUM(b.allowed_amount)            AS total_allowed,
+    COUNT(e.encounter_id)            AS encounter_count,
+    ROUND(SUM(b.allowed_amount)
+        / NULLIF(COUNT(e.encounter_id), 0), 2) AS avg_allowed_per_encounter
+FROM billing b
+JOIN encounters  e ON b.encounter_id = e.encounter_id
+JOIN providers   p ON e.provider_id  = p.provider_id
+JOIN specialties s ON p.specialty_id = s.specialty_id
+GROUP BY 1, 2
+ORDER BY 2, total_allowed DESC;
+
+SCHEMA ANALYSIS:
+----------------
+Tables joined:   billing, encounters, providers, specialties
+Number of joins: 3
+Join chain:      billing → encounters → providers → specialties
+
+PERFORMANCE:
+------------
+Execution time:        28.519 ms
+Planning time:         59.118 ms  ← HIGHEST of all 4 queries!
+Rows returned:         36 rows
+Rows scanned:
+  - billing:           10000 rows
+  - encounters:        10000 rows
+  - providers:         3 rows
+  - specialties:       3 rows
+  Total:               20006 rows
+Memory used:           ~936kB
+
+BOTTLENECK IDENTIFIED:
+----------------------
+1. Planning Time Exceeds Execution Time (Critical Finding)
+   Planning time (59.118ms) is MORE than twice the
+   execution time (28.519ms). This means the optimizer
+   spends more time figuring out how to run the query
+   than actually running it. This happens because with
+   4 tables there are 24 possible join orders to evaluate.
+   At larger scale with more tables this gets worse.
+
+2. Full Chain Traversal for Every Billing Row
+   Every billing row must traverse 3 tables to get
+   specialty_name:
+     billing → encounters → providers → specialties
+   10000 billing rows × 3 hops = 30000 join operations.
+   This chain gets longer and slower with more data.
+
+3. TO_CHAR() on 10000 Billing Rows
+   TO_CHAR(b.claim_date, 'YYYY-MM') is called on every
+   billing row before grouping. Same problem as Query 1
+   but on the billing table instead of encounters.
+
+4. Large Hash Table for Encounters
+   PostgreSQL builds a 519kB hash table for 10000
+   encounters just to join with billing. This memory
+   pressure grows with data volume.
+
+ROOT CAUSE: Longest JOIN chain (4 tables) causes highest
+            planning time. TO_CHAR() called 10000 times.
+
+
+===============================================================
+OVERALL PERFORMANCE SUMMARY
+===============================================================
+
+Query | Execution | Planning | Rows Scanned | Joins | Bottleneck
+------|-----------|----------|--------------|-------|----------
+Q1    | 66.451ms  | 12.960ms | 10006        | 2     | TO_CHAR() + JOIN chain
+Q2    | 120.023ms | 26.688ms | 50006        | 4     | Row explosion (40000 intermediate)
+Q3    | 12.432ms  | 3.353ms  | 23334        | 3+self| O(n²) self-join
+Q4    | 28.519ms  | 59.118ms | 20006        | 3     | Planning overhead + TO_CHAR()
+
+KEY FINDINGS:
+1. Query 2 is the slowest (120ms) due to row explosion
+   from two junction tables producing 40000 intermediate rows
+2. Query 4 has the highest planning overhead (59ms planning
+   vs 28ms execution) due to 4-table join complexity
+3. Query 3 self-join removed 33888 rows — at 1M encounters
+   this becomes catastrophically slow (O(n²) complexity)
+4. All queries use sequential scans — no indexes utilized
+5. TO_CHAR() function calls on large tables add significant
+   overhead that compounds with data volume

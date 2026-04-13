@@ -1,0 +1,559 @@
+# Part 3.4: ETL Design — Healthcare Analytics Star Schema
+# =========================================================
+# Source:   healthcare_analytics (OLTP — normalized 8 tables)
+# Target:   healthcare_dw (Star Schema — 11 tables)
+# Strategy: Daily incremental load for facts and bridges
+#           Weekly full refresh for small stable dimensions
+#           One-time load for dim_date
+# =========================================================
+
+===============================================================
+OVERVIEW
+===============================================================
+
+ETL (Extract, Transform, Load) is the process that moves
+data from the normalized OLTP database into the star schema
+data warehouse. It runs nightly and performs three types
+of work:
+
+1. EXTRACT  — Read new/changed data from healthcare_analytics
+2. TRANSFORM — Clean, enrich, and pre-aggregate the data
+3. LOAD     — Insert transformed data into healthcare_dw
+
+The ETL pipeline is what makes the star schema valuable.
+Pre-computed metrics (is_readmission, total_allowed_amount,
+age_group) are all calculated here — so queries never have
+to do expensive work at runtime.
+
+
+===============================================================
+1. DIMENSION LOAD LOGIC
+===============================================================
+
+---------------------------------------------------------------
+dim_date — One-Time Load (Never Refresh)
+---------------------------------------------------------------
+Purpose: Pre-compute all date attributes for every calendar
+         day so queries never need TO_CHAR() or date functions.
+         Tested impact: Hash Join time dropped from 45ms to 5ms.
+
+PSEUDOCODE:
+  -- Run once at warehouse setup
+  -- Generate every day from 2024-01-01 to 2024-12-31
+
+  FOR each day d IN generate_series('2024-01-01', '2024-12-31'):
+
+    date_key      = TO_CHAR(d, 'YYYYMMDD')::int
+                    -- e.g. May 10 2024 = 20240510
+
+    calendar_date = d
+    year          = EXTRACT(YEAR FROM d)
+    quarter       = EXTRACT(QUARTER FROM d)
+    month         = EXTRACT(MONTH FROM d)
+    month_name    = TO_CHAR(d, 'Month')     -- 'May', 'June'...
+    week          = EXTRACT(WEEK FROM d)
+    day_of_month  = EXTRACT(DAY FROM d)
+    day_of_week   = EXTRACT(DOW FROM d) + 1 -- 1=Sunday, 7=Saturday
+    day_name      = TO_CHAR(d, 'Day')       -- 'Friday', 'Saturday'...
+    is_weekend    = TRUE if day_of_week IN (1, 7) ELSE FALSE
+    is_holiday    = FALSE (default — update manually for holidays)
+    fiscal_year   = EXTRACT(YEAR FROM d)
+    fiscal_quarter = EXTRACT(QUARTER FROM d)
+
+    INSERT INTO dim_date VALUES (all above)
+
+EXAMPLE OUTPUT:
+  date_key | calendar_date | year | month | month_name | is_weekend
+  20240510 | 2024-05-10    | 2024 | 5     | May        | FALSE
+  20240511 | 2024-05-11    | 2024 | 5     | May        | TRUE (Saturday)
+
+NOTE: dim_date was generated using generate_series() in PostgreSQL.
+      366 rows created for all of 2024 (leap year).
+      Never needs refresh unless fiscal calendar changes.
+
+---------------------------------------------------------------
+dim_patient — Daily Load (SCD Type 1 Overwrite)
+---------------------------------------------------------------
+Purpose: Load patient demographics with pre-computed age_group.
+         Avoids age calculation at every query runtime.
+
+PSEUDOCODE:
+  FOR each patient IN oltp.patients:
+
+    -- Calculate age from date of birth
+    age = CURRENT_YEAR - YEAR(date_of_birth)
+
+    -- Pre-compute age group (ETL does this once)
+    age_group = CASE
+                  WHEN age < 18 THEN '0-17'
+                  WHEN age < 35 THEN '18-34'
+                  WHEN age < 55 THEN '35-54'
+                  WHEN age < 65 THEN '55-64'
+                  ELSE '65+'
+                END
+
+    -- Pre-concatenate full name
+    full_name = first_name || ' ' || last_name
+
+    -- Check if patient already exists in warehouse
+    IF patient_id EXISTS in dim_patient WHERE is_current = TRUE:
+
+      -- SCD Type 1: Overwrite existing record
+      UPDATE dim_patient SET
+        full_name      = new full_name,
+        age_group      = new age_group,
+        gender         = new gender,
+        date_of_birth  = new date_of_birth
+      WHERE patient_id = this patient_id
+      AND   is_current = TRUE
+
+      -- NOTE: For SCD Type 2 (full history) instead:
+      -- SET is_current = FALSE, expiry_date = TODAY
+      -- INSERT new row with is_current = TRUE, effective_date = TODAY
+
+    ELSE (patient is new — never loaded before):
+
+      INSERT INTO dim_patient (
+        patient_id, mrn, first_name, last_name, full_name,
+        gender, date_of_birth, age_group,
+        is_current, effective_date)
+      VALUES (all calculated values)
+
+EXAMPLE:
+  Patient John Doe, born 1955 → age = 69 → age_group = '65+'
+  patient_key=1 (auto), patient_id=1001, full_name='John Doe',
+  gender='M', age_group='65+', is_current=TRUE
+
+---------------------------------------------------------------
+dim_provider — Weekly Load (Denormalized)
+---------------------------------------------------------------
+Purpose: Merge provider + specialty + department into one row.
+         ETL does the join once; queries never need to.
+         Eliminates encounters → providers → specialties chain.
+
+PSEUDOCODE:
+  FOR each provider IN oltp.providers:
+
+    -- Fetch related specialty (JOIN done at ETL time not query time)
+    specialty = SELECT * FROM oltp.specialties
+                WHERE specialty_id = provider.specialty_id
+
+    -- Fetch related department
+    department = SELECT * FROM oltp.departments
+                 WHERE department_id = provider.department_id
+
+    full_name = provider.first_name || ' ' || provider.last_name
+
+    IF provider_id EXISTS in dim_provider:
+      UPDATE dim_provider SET
+        full_name       = new full_name,
+        specialty_name  = specialty.specialty_name,
+        department_name = department.department_name,
+        floor           = department.floor
+      WHERE provider_id = this provider_id
+
+    ELSE:
+      INSERT INTO dim_provider (
+        provider_id, full_name, credential,
+        specialty_id, specialty_name, specialty_code,
+        department_id, department_name, floor)
+      VALUES (combined values from 3 OLTP tables)
+
+EXAMPLE:
+  Provider James Chen → specialty = Cardiology → dept = Cardiology Unit
+  provider_key=11 (auto), full_name='James Chen', credential='MD',
+  specialty_name='Cardiology', department_name='Cardiology Unit'
+
+---------------------------------------------------------------
+dim_specialty, dim_department — Weekly Full Refresh
+---------------------------------------------------------------
+Purpose: Small stable tables. Truncate and reload every week.
+
+PSEUDOCODE:
+  -- Specialty
+  DELETE all rows FROM dim_specialty
+  FOR each row IN oltp.specialties:
+    INSERT INTO dim_specialty
+    (specialty_id, specialty_name, specialty_code)
+    VALUES (...)
+
+  -- Department
+  DELETE all rows FROM dim_department
+  FOR each row IN oltp.departments:
+    INSERT INTO dim_department
+    (department_id, department_name, floor, capacity)
+    VALUES (...)
+
+---------------------------------------------------------------
+dim_encounter_type — Manual Load (Static)
+---------------------------------------------------------------
+Purpose: Only 3 values ever. Load once, never change.
+         Boolean flags added for faster filtering.
+
+PSEUDOCODE:
+  INSERT INTO dim_encounter_type VALUES:
+    (1, 'Outpatient', is_inpatient=FALSE, is_emergency=FALSE)
+    (2, 'Inpatient',  is_inpatient=TRUE,  is_emergency=FALSE)
+    (3, 'ER',         is_inpatient=FALSE, is_emergency=TRUE)
+  ON CONFLICT DO NOTHING
+
+---------------------------------------------------------------
+dim_diagnosis, dim_procedure — Weekly Full Refresh
+---------------------------------------------------------------
+PSEUDOCODE:
+  DELETE all rows FROM dim_diagnosis
+  FOR each row IN oltp.diagnoses:
+    INSERT INTO dim_diagnosis
+    (diagnosis_id, icd10_code, icd10_description)
+    VALUES (...)
+
+  DELETE all rows FROM dim_procedure
+  FOR each row IN oltp.procedures:
+    INSERT INTO dim_procedure
+    (procedure_id, cpt_code, cpt_description)
+    VALUES (...)
+
+
+===============================================================
+2. FACT TABLE LOAD LOGIC
+===============================================================
+
+---------------------------------------------------------------
+fact_encounters — Daily Incremental Load
+---------------------------------------------------------------
+Purpose: Load new encounters since last ETL run.
+         Calculate all pre-aggregated metrics during load
+         so queries never need to compute them at runtime.
+
+PSEUDOCODE:
+  -- Get timestamp of last successful ETL run
+  last_run_date = SELECT last_run FROM etl_metadata
+
+  -- Only process NEW encounters (incremental load)
+  FOR each encounter IN oltp.encounters
+  WHERE encounter_date > last_run_date:
+
+    -----------------------------------------------
+    STEP 1: Look up dimension surrogate keys
+    -----------------------------------------------
+    -- Replace natural IDs with warehouse surrogate keys
+
+    encounter_date_key =
+      SELECT date_key FROM dim_date
+      WHERE calendar_date = DATE(encounter.encounter_date)
+      -- e.g. '2024-05-10 10:00:00' → 20240510
+
+    discharge_date_key =
+      IF encounter.discharge_date IS NOT NULL:
+        SELECT date_key FROM dim_date
+        WHERE calendar_date = DATE(encounter.discharge_date)
+      ELSE NULL
+      -- Outpatient encounters have no discharge date
+
+    patient_key =
+      SELECT patient_key FROM dim_patient
+      WHERE patient_id = encounter.patient_id
+      AND   is_current = TRUE
+
+    provider_key =
+      SELECT provider_key FROM dim_provider
+      WHERE provider_id = encounter.provider_id
+
+    specialty_key =
+      SELECT specialty_key FROM dim_specialty
+      WHERE specialty_id = (
+        SELECT specialty_id FROM oltp.providers
+        WHERE provider_id = encounter.provider_id)
+
+    department_key =
+      SELECT department_key FROM dim_department
+      WHERE department_id = encounter.department_id
+
+    encounter_type_key =
+      SELECT encounter_type_key FROM dim_encounter_type
+      WHERE type_name = encounter.encounter_type
+
+    -----------------------------------------------
+    STEP 2: Calculate pre-aggregated metrics
+    -----------------------------------------------
+    -- These calculations run ONCE during ETL
+    -- Queries read stored values — never recalculate
+
+    -- Billing totals (eliminates billing JOIN at query time)
+    total_claim_amount =
+      SELECT SUM(claim_amount) FROM oltp.billing
+      WHERE encounter_id = encounter.encounter_id
+
+    total_allowed_amount =
+      SELECT SUM(allowed_amount) FROM oltp.billing
+      WHERE encounter_id = encounter.encounter_id
+      -- Tested: Q4 dropped from 28.519ms to 10.085ms
+
+    claim_status =
+      SELECT claim_status FROM oltp.billing
+      WHERE encounter_id = encounter.encounter_id
+      LIMIT 1
+
+    -- Clinical counts (eliminate bridge JOIN for simple counts)
+    diagnosis_count =
+      SELECT COUNT(*) FROM oltp.encounter_diagnoses
+      WHERE encounter_id = encounter.encounter_id
+      -- e.g. encounter 7001 has 2 diagnoses → store 2
+
+    procedure_count =
+      SELECT COUNT(*) FROM oltp.encounter_procedures
+      WHERE encounter_id = encounter.encounter_id
+
+    -- Length of stay (eliminate date arithmetic at query time)
+    length_of_stay_days =
+      IF encounter.discharge_date IS NOT NULL:
+        DATEDIFF(discharge_date, encounter_date)
+        -- e.g. admitted June 2, discharged June 6 = 4 days
+      ELSE 0
+      -- Outpatient = same day visit = 0 days
+
+    -----------------------------------------------
+    STEP 3: Detect readmission (most critical step)
+    -----------------------------------------------
+    -- This replaces the O(n²) self-join at query time.
+    -- At 1M encounters the self-join = 333 trillion comparisons.
+    -- Computing here once = O(n) during ETL.
+
+    is_readmission =
+      IF EXISTS (
+        SELECT 1 FROM oltp.encounters previous
+        WHERE previous.patient_id     = encounter.patient_id
+        AND   previous.encounter_type = 'Inpatient'
+        AND   previous.discharge_date IS NOT NULL
+        AND   encounter.encounter_date > previous.discharge_date
+        AND   encounter.encounter_date <=
+              previous.discharge_date + INTERVAL '30 days'
+        AND   previous.encounter_id  != encounter.encounter_id
+      )
+      THEN TRUE
+      ELSE FALSE
+
+    EXAMPLE:
+      John Doe discharged June 6.
+      Returns June 20 (14 days later) → is_readmission = TRUE
+      Jane Smith — first visit ever   → is_readmission = FALSE
+
+    -----------------------------------------------
+    STEP 4: Handle missing and invalid data
+    -----------------------------------------------
+
+    IF patient_key IS NULL:
+      -- Patient exists in encounters but not in dim_patient
+      WRITE TO etl_error_log:
+        (encounter_id, 'patient_key not found', NOW())
+      SKIP this encounter → move to next one
+
+    IF provider_key IS NULL:
+      -- Provider exists in encounters but not in dim_provider
+      WRITE TO etl_error_log:
+        (encounter_id, 'provider_key not found', NOW())
+      SKIP this encounter → move to next one
+
+    IF encounter_date_key NOT IN dim_date:
+      -- Date outside dim_date range
+      WRITE TO etl_error_log:
+        (encounter_id, 'date_key not found in dim_date', NOW())
+      SKIP this encounter
+
+    IF total_allowed_amount IS NULL:
+      -- Billing record not yet arrived (late-arriving fact)
+      SET total_allowed_amount = 0
+      SET claim_status = 'Pending'
+      -- Reconciliation job will update this later
+
+    -----------------------------------------------
+    STEP 5: Insert into fact table
+    -----------------------------------------------
+
+    INSERT INTO fact_encounters (
+      encounter_date_key, discharge_date_key,
+      patient_key, provider_key, specialty_key,
+      department_key, encounter_type_key,
+      encounter_id,
+      total_claim_amount, total_allowed_amount,
+      claim_status, diagnosis_count, procedure_count,
+      length_of_stay_days, is_readmission
+    ) VALUES (all values calculated above)
+
+  -- Update ETL metadata after successful load
+  UPDATE etl_metadata SET last_run_date = NOW()
+
+
+===============================================================
+3. BRIDGE TABLE LOAD LOGIC
+===============================================================
+
+---------------------------------------------------------------
+bridge_encounter_diagnoses — Daily Incremental Load
+---------------------------------------------------------------
+Purpose: For every new encounter loaded into fact_encounters,
+         find all its diagnoses and link them via bridge table.
+         Preserves many-to-many relationship without breaking
+         the fact table grain.
+
+PSEUDOCODE:
+  FOR each new encounter_fact_key loaded today:
+
+    -- Get original encounter_id for OLTP lookup
+    encounter_id = fact_encounters.encounter_id
+                   WHERE encounter_fact_key = this key
+
+    -- Find all diagnoses for this encounter in OLTP
+    FOR each row IN oltp.encounter_diagnoses
+    WHERE encounter_id = this encounter_id:
+
+      -- Look up surrogate key
+      diagnosis_key =
+        SELECT diagnosis_key FROM dim_diagnosis
+        WHERE diagnosis_id = row.diagnosis_id
+
+      -- Determine if primary diagnosis
+      is_primary = (row.diagnosis_sequence = 1)
+
+      INSERT INTO bridge_encounter_diagnoses (
+        encounter_fact_key,
+        diagnosis_key,
+        diagnosis_sequence,
+        is_primary_diagnosis
+      ) VALUES (...)
+
+EXAMPLE:
+  Encounter 7001 (John Doe, May 10) has 2 diagnoses:
+  → bridge row 1: fact_key=1, diag_key=1, seq=1, is_primary=TRUE  (Hypertension)
+  → bridge row 2: fact_key=1, diag_key=2, seq=2, is_primary=FALSE (Diabetes)
+
+---------------------------------------------------------------
+bridge_encounter_procedures — Daily Incremental Load
+---------------------------------------------------------------
+Purpose: Same approach as bridge_encounter_diagnoses but
+         for procedures. Also stores procedure_date_key
+         for procedure-level date analysis.
+
+PSEUDOCODE:
+  FOR each new encounter_fact_key loaded today:
+
+    encounter_id = fact_encounters.encounter_id
+                   WHERE encounter_fact_key = this key
+
+    FOR each row IN oltp.encounter_procedures
+    WHERE encounter_id = this encounter_id:
+
+      procedure_key =
+        SELECT procedure_key FROM dim_procedure
+        WHERE procedure_id = row.procedure_id
+
+      procedure_date_key =
+        SELECT date_key FROM dim_date
+        WHERE calendar_date = row.procedure_date
+
+      INSERT INTO bridge_encounter_procedures (
+        encounter_fact_key,
+        procedure_key,
+        procedure_date_key
+      ) VALUES (...)
+
+EXAMPLE:
+  Encounter 7001 (John Doe, May 10) has 2 procedures:
+  → bridge row 1: fact_key=1, proc_key=1, date_key=20240510 (Office Visit)
+  → bridge row 2: fact_key=1, proc_key=2, date_key=20240510 (EKG)
+
+
+===============================================================
+4. REFRESH STRATEGY
+===============================================================
+
+---------------------------------------------------------------
+Schedule
+---------------------------------------------------------------
+Table                  | Frequency     | Method
+-----------------------|---------------|--------------------
+dim_date               | One-time      | generate_series()
+dim_patient            | Daily         | SCD Type 1 upsert
+dim_provider           | Weekly        | Full refresh
+dim_specialty          | Weekly        | Truncate + reload
+dim_department         | Weekly        | Truncate + reload
+dim_encounter_type     | Manual only   | Static 3 values
+dim_diagnosis          | Weekly        | Truncate + reload
+dim_procedure          | Weekly        | Truncate + reload
+fact_encounters        | Daily         | Incremental (new only)
+bridge_encounter_diag  | Daily         | Incremental (follows fact)
+bridge_encounter_proc  | Daily         | Incremental (follows fact)
+
+---------------------------------------------------------------
+Incremental Load Strategy
+---------------------------------------------------------------
+PSEUDOCODE:
+  -- Store last run timestamp in metadata table
+  CREATE TABLE etl_metadata (
+    last_run_date TIMESTAMP,
+    rows_loaded   INT,
+    rows_skipped  INT,
+    errors        INT
+  );
+
+  -- Each run only loads encounters after last run
+  SELECT * FROM oltp.encounters
+  WHERE encounter_date > (SELECT last_run_date FROM etl_metadata)
+
+  -- After successful load
+  UPDATE etl_metadata SET
+    last_run_date = NOW(),
+    rows_loaded   = count of inserted rows,
+    rows_skipped  = count of error rows,
+    errors        = count of error log entries
+
+  -- Use transactions — if anything fails, nothing commits
+  BEGIN TRANSACTION
+    -- all inserts here
+  COMMIT  -- or ROLLBACK if any error occurs
+
+---------------------------------------------------------------
+Handling Late-Arriving Facts
+---------------------------------------------------------------
+Problem:
+  A billing record arrives 3 days AFTER the encounter
+  was already loaded into fact_encounters with
+  total_allowed_amount = 0 and claim_status = 'Pending'.
+
+Solution — Daily Reconciliation Job:
+  PSEUDOCODE:
+    FOR each fact_encounter WHERE total_allowed_amount = 0:
+
+      -- Check if billing now exists in OLTP
+      billing = SELECT * FROM oltp.billing
+                WHERE encounter_id = fact.encounter_id
+
+      IF billing IS NOT NULL:
+        UPDATE fact_encounters SET
+          total_allowed_amount = billing.allowed_amount,
+          total_claim_amount   = billing.claim_amount,
+          claim_status         = billing.claim_status
+        WHERE encounter_id = fact.encounter_id
+
+        LOG to etl_reconciliation_log:
+          (encounter_id, 'late billing resolved', NOW())
+
+---------------------------------------------------------------
+Error Handling
+---------------------------------------------------------------
+  - All skipped records written to etl_error_log table:
+    (encounter_id, error_reason, error_timestamp)
+
+  - If error rate > 1% of total records in a run:
+    STOP the run and send alert to data engineering team
+
+  - Never load partial data:
+    Wrap all inserts in transactions
+    COMMIT only after all steps succeed
+    ROLLBACK on any failure
+
+  - Maintain full audit log of every ETL run:
+    (run_id, start_time, end_time, rows_loaded,
+     rows_skipped, error_count, status)
+
+  - Keep 30 days of etl_error_log history for debugging

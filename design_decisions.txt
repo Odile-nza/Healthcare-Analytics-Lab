@@ -1,0 +1,222 @@
+# Part 3.1: Design Decisions — Healthcare Star Schema
+# ====================================================
+# Database: healthcare_dw (PostgreSQL on Neon)
+# Based on: OLTP performance analysis from Part 2
+# ====================================================
+
+===============================================================
+DECISION 1: Fact Table Grain
+===============================================================
+
+CHOSEN OPTION: Option A — One row per encounter
+
+REASONING:
+All 4 business queries are encounter-centric:
+  Q1: Count encounters by month and specialty
+  Q2: Find diagnosis-procedure combinations per encounter
+  Q3: Detect readmissions based on encounter dates
+  Q4: Calculate revenue per encounter
+
+Option B (one row per diagnosis) was rejected because:
+  - Would cause row explosion in the fact table itself
+  - SUM(allowed_amount) would double-count revenue
+  - Same problem as OLTP junction tables — proven slow
+
+Option C (one row per procedure) was rejected for same reasons.
+
+With Option A, one row = one hospital visit. This is the
+cleanest grain that supports all 4 queries without
+duplication. Diagnoses and procedures are handled
+separately via bridge tables when needed.
+
+GRAIN DECLARATION:
+"One row in fact_encounters represents a single patient
+encounter — one hospital visit from admission to discharge
+regardless of how many diagnoses or procedures occurred."
+
+
+===============================================================
+DECISION 2: Dimension Tables
+===============================================================
+
+DIM_DATE
+--------
+Columns: date_key, calendar_date, year, quarter, month,
+         month_name, week, day_of_month, day_of_week,
+         day_name, is_weekend, is_holiday,
+         fiscal_year, fiscal_quarter
+
+Reason: Query 1 and Query 4 both used TO_CHAR() on datetime
+columns — called 10000 times each in our test. Pre-computing
+year, month, month_name as columns eliminates these function
+calls entirely. Generated automatically for all of 2024
+(366 rows) using generate_series().
+
+DIM_PATIENT
+-----------
+Columns: patient_key, patient_id, mrn, first_name, last_name,
+         full_name, gender, date_of_birth, age_group,
+         is_current, effective_date
+
+Reason: age_group is pre-computed during ETL (0-17, 18-34,
+35-54, 55-64, 65+). This avoids age calculation at query
+time. SCD Type 2 columns (is_current, effective_date) added
+to track patient demographic changes over time.
+
+DIM_PROVIDER (Denormalized)
+---------------------------
+Columns: provider_key, provider_id, first_name, last_name,
+         full_name, credential, specialty_id, specialty_name,
+         specialty_code, department_id, department_name, floor
+
+Reason: Queries 1, 3, 4 all needed to traverse
+encounters → providers → specialties just to get
+specialty_name. By merging specialty and department
+info directly into dim_provider, this 2-hop chain
+is eliminated. One join instead of two.
+
+DIM_SPECIALTY
+-------------
+Columns: specialty_key, specialty_id, specialty_name,
+         specialty_code
+
+Reason: Kept as separate dimension for specialty-level
+filtering and grouping. specialty_key stored directly
+on fact table for fast aggregation.
+
+DIM_DEPARTMENT
+--------------
+Columns: department_key, department_id, department_name,
+         floor, capacity
+
+Reason: Natural dimension for filtering encounters
+by hospital location. Kept separate for flexibility.
+
+DIM_ENCOUNTER_TYPE
+------------------
+Columns: encounter_type_key, type_name, is_inpatient,
+         is_emergency
+
+Reason: Low-cardinality dimension (only 3 values).
+Added boolean flags is_inpatient and is_emergency —
+boolean comparison is faster than string comparison:
+  WHERE et.is_inpatient = TRUE  (boolean — fast)
+  vs
+  WHERE encounter_type = 'Inpatient'  (string — slow)
+
+DIM_DIAGNOSIS
+-------------
+Columns: diagnosis_key, diagnosis_id, icd10_code,
+         icd10_description
+
+Reason: Used via bridge table for many-to-many with
+encounters. Kept separate to avoid row explosion
+in fact table.
+
+DIM_PROCEDURE
+-------------
+Columns: procedure_key, procedure_id, cpt_code,
+         cpt_description
+
+Reason: Same as dim_diagnosis — used via bridge table
+for many-to-many relationship with encounters.
+
+
+===============================================================
+DECISION 3: Pre-Aggregated Metrics in Fact Table
+===============================================================
+
+The following metrics are pre-computed during ETL and
+stored directly in fact_encounters:
+
+TOTAL_CLAIM_AMOUNT & TOTAL_ALLOWED_AMOUNT
+-----------------------------------------
+Source: billing table (SUM of amounts per encounter)
+Reason: Query 4 required joining billing → encounters →
+providers → specialties (3 joins, 59ms planning time).
+Pre-storing allowed_amount in fact table eliminates
+the billing join entirely. Query 4 dropped from
+28.519ms to 10.085ms — 2.8x faster.
+
+DIAGNOSIS_COUNT
+---------------
+Source: COUNT(*) from encounter_diagnoses per encounter
+Reason: Common analytical question — average diagnoses
+per encounter. Without pre-aggregation requires joining
+to bridge table. Storing directly enables:
+  AVG(diagnosis_count) — instant, no join needed.
+
+PROCEDURE_COUNT
+---------------
+Source: COUNT(*) from encounter_procedures per encounter
+Reason: Same as diagnosis_count — avoids bridge table
+join for simple count queries.
+
+LENGTH_OF_STAY_DAYS
+-------------------
+Source: DATEDIFF(discharge_date, encounter_date)
+Reason: Key clinical metric. Computing date difference
+on every query row is wasteful when the value never
+changes after the encounter ends. Pre-computing once
+during ETL saves repeated calculation.
+
+IS_READMISSION
+--------------
+Source: Self-join logic computed during ETL
+Reason: This is the most impactful pre-aggregation.
+OLTP Query 3 self-join removed 33888 rows and at
+1 million encounters would perform 333 billion
+comparisons (O(n²)). Pre-computing as a boolean
+flag during ETL reduces query to:
+  SUM(CASE WHEN is_readmission THEN 1 ELSE 0 END)
+This is O(n) — linear scan. ETL does the work once
+nightly; every analyst benefits immediately.
+
+
+===============================================================
+DECISION 4: Bridge Tables
+===============================================================
+
+DECISION: YES — Use bridge tables for diagnoses
+          and procedures
+
+ALTERNATIVE CONSIDERED: Denormalize into fact table
+  - Add primary_diagnosis_code column to fact_encounters
+  - Add primary_procedure_code column to fact_encounters
+
+WHY ALTERNATIVE WAS REJECTED:
+  1. Limited to one diagnosis/procedure per encounter
+     Real encounters have 2-3 diagnoses and 2-3 procedures.
+     Flattening would require multiple columns or lose data.
+
+  2. Row explosion in fact table
+     If we add one row per diagnosis per encounter, the fact
+     table grain breaks and revenue figures double/triple count.
+     We proved this causes problems in Query 2 where 10000
+     encounters became 40000 intermediate rows.
+
+  3. Cannot answer clinical questions
+     "Find all encounters where patient had both Hypertension
+     AND Heart Failure" — impossible with denormalized columns.
+
+WHY BRIDGE TABLES WORK:
+  - fact_encounters keeps grain at ONE ROW PER ENCOUNTER
+  - bridge_encounter_diagnoses stores the many-to-many links
+  - bridge_encounter_procedures stores the many-to-many links
+  - Queries that don't need diagnoses/procedures (Q1, Q3, Q4)
+    never touch bridge tables — zero overhead
+  - Queries that need diagnosis/procedure details (Q2) join
+    through bridge tables when needed
+
+TRADE-OFF ACKNOWLEDGED:
+  Query 2 showed that bridge tables still cause row explosion
+  (40000 intermediate rows) similar to OLTP junction tables.
+  This is an inherent challenge with many-to-many relationships
+  regardless of schema design. The star schema did not improve
+  Query 2 performance at 10000 rows.
+
+PRODUCTION RECOMMENDATION:
+  In production, add a separate fact_encounter_diagnoses table
+  at diagnosis grain for clinical analytics teams. This gives
+  two fact tables serving different purposes without
+  compromising either design.
